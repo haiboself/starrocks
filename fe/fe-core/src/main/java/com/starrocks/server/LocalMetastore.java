@@ -5417,9 +5417,17 @@ public class LocalMetastore implements ConnectorMetadata, MVRepairHandler, Memor
 
             OlapTable olapTable = (OlapTable) table;
             // check partition exist
+            boolean isAutomaticPartition = olapTable.getPartitionInfo().isAutomaticPartition();
             for (String partName : partitionNames) {
                 if (!olapTable.checkPartitionNameExist(partName, false)) {
-                    throw new DdlException("Partition[" + partName + "] does not exist");
+                    // For automatic partition tables (e.g. expression-partitioned tables),
+                    // partitions are created automatically on data load and users never
+                    // pre-create them manually. A missing formal partition is therefore
+                    // allowed: it will be auto-created from the corresponding temporary
+                    // partition during the replacement.
+                    if (!isAutomaticPartition) {
+                        throw new DdlException("Partition[" + partName + "] does not exist");
+                    }
                 }
             }
             for (String partName : tempPartitionNames) {
@@ -5428,8 +5436,10 @@ public class LocalMetastore implements ConnectorMetadata, MVRepairHandler, Memor
                 }
             }
 
-            partitionNames.stream().forEach(e ->
-                    GlobalStateMgr.getCurrentState().getAnalyzeMgr().recordDropPartition(olapTable.getPartition(e).getId()));
+            partitionNames.stream()
+                    .filter(e -> olapTable.checkPartitionNameExist(e, false))
+                    .forEach(e -> GlobalStateMgr.getCurrentState().getAnalyzeMgr()
+                            .recordDropPartition(olapTable.getPartition(e).getId()));
             olapTable.checkReplaceTempPartitions(partitionNames, tempPartitionNames, isStrictRange);
 
             // write log

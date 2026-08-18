@@ -22,6 +22,7 @@ import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.DiskInfo;
 import com.starrocks.catalog.DistributionInfo;
+import com.starrocks.catalog.ExpressionRangePartitionInfo;
 import com.starrocks.catalog.HashDistributionInfo;
 import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.catalog.LocalTablet;
@@ -30,12 +31,14 @@ import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.PartitionInfo;
 import com.starrocks.catalog.PartitionKey;
+import com.starrocks.catalog.PartitionType;
 import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.catalog.RandomDistributionInfo;
 import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.SinglePartitionInfo;
 import com.starrocks.catalog.Table;
+import com.starrocks.catalog.TableName;
 import com.starrocks.catalog.TabletMeta;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.util.concurrent.lock.LockType;
@@ -45,6 +48,7 @@ import com.starrocks.lake.StarOSAgent;
 import com.starrocks.load.PartitionUtils;
 import com.starrocks.persist.AddPartitionsInfoV2;
 import com.starrocks.persist.AddSubPartitionsInfoV2;
+import com.starrocks.persist.ColumnIdExpr;
 import com.starrocks.persist.ColumnRenameInfo;
 import com.starrocks.persist.CreateDbInfo;
 import com.starrocks.persist.CreateTableInfo;
@@ -89,12 +93,15 @@ import com.starrocks.sql.ast.RollupRenameClause;
 import com.starrocks.sql.ast.SingleRangePartitionDesc;
 import com.starrocks.sql.ast.TableRef;
 import com.starrocks.sql.ast.TableRenameClause;
+import com.starrocks.sql.ast.expression.SlotRef;
 import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.system.Backend;
 import com.starrocks.thrift.TStorageMedium;
 import com.starrocks.thrift.TStorageType;
 import com.starrocks.type.DateType;
 import com.starrocks.type.IntegerType;
+import com.starrocks.type.PrimitiveType;
+import com.starrocks.type.ScalarType;
 import com.starrocks.utframe.UtFrameUtils;
 import com.starrocks.warehouse.cngroup.ComputeResource;
 import mockit.Mock;
@@ -247,6 +254,38 @@ public class LocalMetastoreSimpleOpsEditLogTest {
         olapTable.setIndexMeta(INDEX_ID, tableName, columns, 0, 0, (short) 1, TStorageType.COLUMN, KeysType.DUP_KEYS);
         olapTable.setBaseIndexMetaId(INDEX_ID);
         olapTable.addPartition(partition);
+        olapTable.setTableProperty(new com.starrocks.catalog.TableProperty(new HashMap<>()));
+        return olapTable;
+    }
+
+    // Helper method to create an expression-range partitioned (automatic partition) OlapTable
+    // with no formal partitions, mirroring a table created with `PARTITION BY expr`.
+    private static OlapTable createExpressionRangePartitionedOlapTable(long tableId, String tableName) {
+        List<Column> columns = new ArrayList<>();
+        Column partitionCol = new Column("event_day", new ScalarType(PrimitiveType.DATETIME));
+        partitionCol.setIsKey(true);
+        columns.add(partitionCol);
+        columns.add(new Column("v2", IntegerType.BIGINT));
+
+        List<ColumnIdExpr> partitionExprs = new ArrayList<>();
+        partitionExprs.add(ColumnIdExpr.create(new SlotRef(new TableName("test", tableName), "event_day")));
+        ExpressionRangePartitionInfo partitionInfo = new ExpressionRangePartitionInfo(
+                partitionExprs, List.of(partitionCol), PartitionType.EXPR_RANGE);
+
+        DistributionInfo distributionInfo = new HashDistributionInfo(3, List.of(partitionCol));
+
+        MaterializedIndex baseIndex = new MaterializedIndex(INDEX_ID, MaterializedIndex.IndexState.NORMAL);
+        LocalTablet tablet = new LocalTablet(TABLET_ID);
+        TabletMeta tabletMeta = new TabletMeta(DB_ID, tableId, PARTITION_ID, INDEX_ID, TStorageMedium.HDD);
+        baseIndex.addTablet(tablet, tabletMeta);
+
+        Replica replica = new Replica(REPLICA_ID, BACKEND_ID, 0, Replica.ReplicaState.NORMAL);
+        replica.updateVersionInfo(2, 2, 2);
+        tablet.addReplica(replica);
+
+        OlapTable olapTable = new OlapTable(tableId, tableName, columns, KeysType.DUP_KEYS, partitionInfo, distributionInfo);
+        olapTable.setIndexMeta(INDEX_ID, tableName, columns, 0, 0, (short) 1, TStorageType.COLUMN, KeysType.DUP_KEYS);
+        olapTable.setBaseIndexMetaId(INDEX_ID);
         olapTable.setTableProperty(new com.starrocks.catalog.TableProperty(new HashMap<>()));
         return olapTable;
     }
@@ -886,6 +925,123 @@ public class LocalMetastoreSimpleOpsEditLogTest {
         } finally {
             GlobalStateMgr.getCurrentState().setEditLog(originalEditLog);
         }
+    }
+
+    @Test
+    public void testReplaceTempPartitionAutoCreateFormalPartitionForAutomaticTable() throws Exception {
+        mockBuildPartitionsNoOp();
+        LocalMetastore metastore = GlobalStateMgr.getCurrentState().getLocalMetastore();
+        Database db = metastore.getDb(DB_NAME);
+        String tableName = "test_replace_temp_partition_auto_create";
+        Assertions.assertNotNull(db);
+
+        // Expression-partitioned (automatic partition) table with no formal partitions,
+        // mirroring `CREATE TABLE ... PARTITION BY date_trunc('day', event_day)`.
+        OlapTable table = createExpressionRangePartitionedOlapTable(GlobalStateMgr.getCurrentState().getNextId(), tableName);
+        db.registerTableUnlocked(table);
+        Assertions.assertTrue(table.getPartitionInfo().isAutomaticPartition());
+        Assertions.assertTrue(table.getPartitions().isEmpty());
+
+        // Simulate `ALTER TABLE ... ADD TEMPORARY PARTITIONS START ("2026-08-14") END ("2026-08-15")
+        // EVERY (INTERVAL 1 DAY)`, which creates temp partition "tp20260814" with range
+        // [2026-08-14, 2026-08-15).
+        long tempPartitionId = GlobalStateMgr.getCurrentState().getNextId();
+        RangePartitionInfo rangeInfo = (RangePartitionInfo) table.getPartitionInfo();
+        PartitionKey lowerKey = PartitionKey.ofDate(LocalDate.parse("2026-08-14"));
+        PartitionKey upperKey = PartitionKey.ofDate(LocalDate.parse("2026-08-15"));
+        Range<PartitionKey> tempRange = Range.closedOpen(lowerKey, upperKey);
+        rangeInfo.addPartition(tempPartitionId, true, tempRange,
+                com.starrocks.catalog.DataProperty.DEFAULT_DATA_PROPERTY, (short) 1);
+        Partition tempPartition = new Partition(tempPartitionId, tempPartitionId, "tp20260814",
+                new MaterializedIndex(INDEX_ID, MaterializedIndex.IndexState.NORMAL), table.getDefaultDistributionInfo());
+        table.addTempPartition(tempPartition);
+        Assertions.assertTrue(table.checkPartitionNameExist("tp20260814", true));
+
+        // The formal partition "p20260814" does not exist yet. For automatic partition tables it
+        // should be auto-created from the temp partition instead of failing.
+        ReplacePartitionClause clause = new ReplacePartitionClause(
+                new PartitionRef(List.of("p20260814"), false, NodePosition.ZERO),
+                new PartitionRef(List.of("tp20260814"), true, NodePosition.ZERO),
+                new HashMap<>());
+        clause.setStrictRange(true);
+        clause.setUseTempPartitionName(false);
+
+        metastore.replaceTempPartition(db, tableName, clause);
+        Assertions.assertFalse(table.checkPartitionNameExist("tp20260814", true));
+        Assertions.assertTrue(table.checkPartitionNameExist("p20260814", false));
+        Assertions.assertEquals(1, table.getPartitions().size());
+        Partition promotedPartition = table.getPartition("p20260814");
+        Assertions.assertNotNull(promotedPartition);
+        Assertions.assertEquals(tempRange, rangeInfo.getRange(promotedPartition.getId()));
+
+        // The same operation must replay identically on a follower.
+        ReplacePartitionOperationLog replayInfo = (ReplacePartitionOperationLog) UtFrameUtils.PseudoJournalReplayer
+                .replayNextJournal(OperationType.OP_REPLACE_TEMP_PARTITION);
+        Assertions.assertNotNull(replayInfo);
+        Assertions.assertEquals(db.getId(), replayInfo.getDbId());
+        Assertions.assertEquals(table.getId(), replayInfo.getTblId());
+
+        LocalMetastore followerMetastore = new LocalMetastore(
+                GlobalStateMgr.getCurrentState(), new CatalogRecycleBin(),
+                new com.starrocks.catalog.ColocateTableIndex());
+        Database followerDb = new Database(db.getId(), db.getFullName());
+        followerMetastore.unprotectCreateDb(followerDb);
+        OlapTable followerTable = createExpressionRangePartitionedOlapTable(table.getId(), tableName);
+        followerDb.registerTableUnlocked(followerTable);
+        RangePartitionInfo followerRangeInfo = (RangePartitionInfo) followerTable.getPartitionInfo();
+        followerRangeInfo.addPartition(tempPartitionId, true, tempRange,
+                com.starrocks.catalog.DataProperty.DEFAULT_DATA_PROPERTY, (short) 1);
+        Partition followerTempPartition = new Partition(tempPartitionId, tempPartitionId, "tp20260814",
+                new MaterializedIndex(INDEX_ID, MaterializedIndex.IndexState.NORMAL),
+                followerTable.getDefaultDistributionInfo());
+        followerTable.addTempPartition(followerTempPartition);
+        Assertions.assertTrue(followerTable.checkPartitionNameExist("tp20260814", true));
+
+        LocalMetastore originalMetastore = GlobalStateMgr.getCurrentState().getLocalMetastore();
+        GlobalStateMgr.getCurrentState().setLocalMetastore(followerMetastore);
+        try {
+            followerMetastore.replayReplaceTempPartition(replayInfo);
+        } finally {
+            GlobalStateMgr.getCurrentState().setLocalMetastore(originalMetastore);
+        }
+        Assertions.assertFalse(followerTable.checkPartitionNameExist("tp20260814", true));
+        Assertions.assertTrue(followerTable.checkPartitionNameExist("p20260814", false));
+        Partition followerPromotedPartition = followerTable.getPartition("p20260814");
+        Assertions.assertNotNull(followerPromotedPartition);
+        Assertions.assertEquals(tempRange, followerRangeInfo.getRange(followerPromotedPartition.getId()));
+    }
+
+    @Test
+    public void testReplaceTempPartitionRejectMissingFormalForNonAutomaticTable() throws Exception {
+        mockBuildPartitionsNoOp();
+        LocalMetastore metastore = GlobalStateMgr.getCurrentState().getLocalMetastore();
+        Database db = metastore.getDb(DB_NAME);
+        String tableName = "test_replace_temp_partition_reject_missing";
+        Assertions.assertNotNull(db);
+
+        // For non-automatic (manually partitioned) tables the formal partition must exist.
+        OlapTable table = createRangePartitionedOlapTable(GlobalStateMgr.getCurrentState().getNextId(), tableName);
+        db.registerTableUnlocked(table);
+        Partition sourcePartition = table.getPartition("p1");
+        Assertions.assertNotNull(sourcePartition);
+
+        long tempPartitionId = GlobalStateMgr.getCurrentState().getNextId();
+        PartitionUtils.createAndAddTempPartitionsForTable(db, table, "_tmp",
+                List.of(sourcePartition.getId()), List.of(tempPartitionId), null, null);
+        Assertions.assertTrue(table.checkPartitionNameExist("p1_tmp", true));
+
+        ReplacePartitionClause clause = new ReplacePartitionClause(
+                new PartitionRef(List.of("p9"), false, NodePosition.ZERO),
+                new PartitionRef(List.of("p1_tmp"), true, NodePosition.ZERO),
+                new HashMap<>());
+        clause.setStrictRange(true);
+        clause.setUseTempPartitionName(false);
+
+        DdlException exception = Assertions.assertThrows(DdlException.class,
+                () -> metastore.replaceTempPartition(db, tableName, clause));
+        Assertions.assertTrue(exception.getMessage().contains("Partition[p9] does not exist"));
+        Assertions.assertTrue(table.checkPartitionNameExist("p1_tmp", true));
+        Assertions.assertTrue(table.checkPartitionNameExist("p1", false));
     }
 
     // Test alterDatabaseQuota

@@ -286,6 +286,7 @@ PROPERTIES (
 
 - When a table has temporary partitions, you cannot use the `ALTER` command to perform Schema Change operations on the table.
 - When performing Schema Change operations on a table, you cannot add temporary partitions to the table.
+- For automatic partition tables (for example, tables created with expression partitioning), the formal partition does not need to exist in advance. If it does not exist, StarRocks automatically creates the formal partition from the temporary partition during the replacement.
 
 ## Delete temporary partitions
 

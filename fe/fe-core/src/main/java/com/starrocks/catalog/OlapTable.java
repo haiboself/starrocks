@@ -2565,60 +2565,141 @@ public class OlapTable extends Table {
     public void checkReplaceTempPartitions(List<String> partitionNames,
                                            List<String> tempPartitionNames,
                                            boolean strictRange) throws DdlException {
+        // For automatic partition tables (e.g. expression-partitioned tables), a formal partition in
+        // `partitionNames` may not exist yet because partitions are created automatically on data
+        // load. In that case the formal partition is auto-created from the corresponding temporary
+        // partition during the replacement, so only the temporary partition needs to be valid and
+        // conflict-free with the formal partitions that are NOT part of this replacement.
+        boolean autoCreateMissingPartitions = partitionInfo.isAutomaticPartition();
         if (partitionInfo instanceof RangePartitionInfo) {
             RangePartitionInfo rangeInfo = (RangePartitionInfo) partitionInfo;
 
-            if (strictRange) {
-                // check if range of partitions and temp partitions are exactly same
-                List<Range<PartitionKey>> rangeList = Lists.newArrayList();
-                List<Range<PartitionKey>> tempRangeList = Lists.newArrayList();
-                for (String partName : partitionNames) {
-                    Partition partition = nameToPartition.get(partName);
-                    Preconditions.checkNotNull(partition);
+            // Pair each formal partition name with the temp partition at the same position.
+            // Existing formal partitions are "replaced" (their range must strictly match the temp
+            // range, or at least not conflict after the replacement). Missing formal partitions are
+            // "auto-created" from the temp partition at the same position, which only needs to be
+            // conflict-free with the formal partitions that are not part of this replacement.
+            Set<Long> replacePartitionIds = Sets.newHashSet();
+            List<Range<PartitionKey>> rangeList = Lists.newArrayList();
+            List<Range<PartitionKey>> tempRangeList = Lists.newArrayList();
+            List<Range<PartitionKey>> autoCreateRanges = Lists.newArrayList();
+            int pairCount = Math.min(partitionNames.size(), tempPartitionNames.size());
+            for (int i = 0; i < pairCount; i++) {
+                String formalName = partitionNames.get(i);
+                String tempName = tempPartitionNames.get(i);
+                Partition tempPartition = tempPartitions.getPartition(tempName);
+                Preconditions.checkNotNull(tempPartition,
+                        "Temp partition[" + tempName + "] does not exist");
+                Partition partition = nameToPartition.get(formalName);
+                if (partition == null) {
+                    if (!autoCreateMissingPartitions) {
+                        throw new DdlException("Partition[" + formalName + "] does not exist");
+                    }
+                    autoCreateRanges.add(rangeInfo.getRange(tempPartition.getId()));
+                } else {
+                    replacePartitionIds.add(partition.getId());
+                    rangeList.add(rangeInfo.getRange(partition.getId()));
+                    tempRangeList.add(rangeInfo.getRange(tempPartition.getId()));
+                }
+            }
+            // Temp partitions without a positionally corresponding formal partition are promoted
+            // as-is (they keep their temp names). For automatic partition tables they are treated
+            // as auto-created partitions; otherwise keep the original validation behavior.
+            if (tempPartitionNames.size() > partitionNames.size()) {
+                for (int i = pairCount; i < tempPartitionNames.size(); i++) {
+                    Partition tempPartition = tempPartitions.getPartition(tempPartitionNames.get(i));
+                    Preconditions.checkNotNull(tempPartition,
+                            "Temp partition[" + tempPartitionNames.get(i) + "] does not exist");
+                    if (autoCreateMissingPartitions) {
+                        autoCreateRanges.add(rangeInfo.getRange(tempPartition.getId()));
+                    } else {
+                        tempRangeList.add(rangeInfo.getRange(tempPartition.getId()));
+                    }
+                }
+            }
+            // Formal partitions without a positionally corresponding temp partition are dropped by
+            // the replacement. Keep their ranges in the strict-match list (strict mode still
+            // requires one temp partition per formal partition) and exclude them from the
+            // conflict-check base. A missing one is a no-op since there is nothing to drop.
+            for (int i = pairCount; i < partitionNames.size(); i++) {
+                Partition partition = nameToPartition.get(partitionNames.get(i));
+                if (partition != null) {
+                    replacePartitionIds.add(partition.getId());
                     rangeList.add(rangeInfo.getRange(partition.getId()));
                 }
+            }
 
-                for (String partName : tempPartitionNames) {
-                    Partition partition = tempPartitions.getPartition(partName);
-                    Preconditions.checkNotNull(partition);
-                    tempRangeList.add(rangeInfo.getRange(partition.getId()));
-                }
+            if (strictRange) {
+                // check if range of existing partitions and their temp partitions are exactly same
                 RangeUtils.checkRangeListsMatch(rangeList, tempRangeList);
             } else {
                 // check after replacing, whether the range will conflict
-                Set<Long> replacePartitionIds = Sets.newHashSet();
-                for (String partName : partitionNames) {
-                    Partition partition = nameToPartition.get(partName);
-                    Preconditions.checkNotNull(partition);
-                    replacePartitionIds.add(partition.getId());
-                }
-                List<Range<PartitionKey>> replacePartitionRanges = Lists.newArrayList();
-                for (String partName : tempPartitionNames) {
-                    Partition partition = tempPartitions.getPartition(partName);
-                    Preconditions.checkNotNull(partition);
-                    replacePartitionRanges.add(rangeInfo.getRange(partition.getId()));
-                }
                 List<Range<PartitionKey>> sortedRangeList = rangeInfo.getRangeList(replacePartitionIds, false);
-                RangeUtils.checkRangeConflict(sortedRangeList, replacePartitionRanges);
+                RangeUtils.checkRangeConflict(sortedRangeList, tempRangeList);
+            }
+            // The auto-created partitions must not conflict with the formal partitions that are
+            // not part of this replacement.
+            if (!autoCreateRanges.isEmpty()) {
+                List<Range<PartitionKey>> remainingRanges = rangeInfo.getRangeList(replacePartitionIds, false);
+                RangeUtils.checkRangeConflict(remainingRanges, autoCreateRanges);
             }
         } else if (partitionInfo instanceof ListPartitionInfo) {
             ListPartitionInfo listInfo = (ListPartitionInfo) partitionInfo;
             List<Partition> partitionList = new ArrayList<>();
-            for (String partName : partitionNames) {
-                Partition partition = nameToPartition.get(partName);
-                Preconditions.checkNotNull(partition);
-                partitionList.add(partition);
-            }
             List<Partition> tempPartitionList = new ArrayList<>();
-            for (String partName : tempPartitionNames) {
-                Partition tempPartition = tempPartitions.getPartition(partName);
-                Preconditions.checkNotNull(tempPartition);
-                tempPartitionList.add(tempPartition);
+            List<Partition> autoCreateTempPartitions = new ArrayList<>();
+            int pairCount = Math.min(partitionNames.size(), tempPartitionNames.size());
+            for (int i = 0; i < pairCount; i++) {
+                String formalName = partitionNames.get(i);
+                String tempName = tempPartitionNames.get(i);
+                Partition tempPartition = tempPartitions.getPartition(tempName);
+                Preconditions.checkNotNull(tempPartition,
+                        "Temp partition[" + tempName + "] does not exist");
+                Partition partition = nameToPartition.get(formalName);
+                if (partition == null) {
+                    if (!autoCreateMissingPartitions) {
+                        throw new DdlException("Partition[" + formalName + "] does not exist");
+                    }
+                    autoCreateTempPartitions.add(tempPartition);
+                } else {
+                    partitionList.add(partition);
+                    tempPartitionList.add(tempPartition);
+                }
+            }
+            // Temp partitions without a positionally corresponding formal partition are promoted
+            // as-is (they keep their temp names). For automatic partition tables they are treated
+            // as auto-created partitions; otherwise keep the original validation behavior.
+            if (tempPartitionNames.size() > partitionNames.size()) {
+                for (int i = pairCount; i < tempPartitionNames.size(); i++) {
+                    Partition tempPartition = tempPartitions.getPartition(tempPartitionNames.get(i));
+                    Preconditions.checkNotNull(tempPartition,
+                            "Temp partition[" + tempPartitionNames.get(i) + "] does not exist");
+                    if (autoCreateMissingPartitions) {
+                        autoCreateTempPartitions.add(tempPartition);
+                    } else {
+                        tempPartitionList.add(tempPartition);
+                    }
+                }
+            }
+            // Formal partitions without a positionally corresponding temp partition are dropped by
+            // the replacement. Keep them in the strict-match list (strict mode still requires one
+            // temp partition per formal partition) and exclude them from the conflict-check base.
+            // A missing one is a no-op since there is nothing to drop.
+            for (int i = pairCount; i < partitionNames.size(); i++) {
+                Partition partition = nameToPartition.get(partitionNames.get(i));
+                if (partition != null) {
+                    partitionList.add(partition);
+                }
             }
             if (strictRange) {
                 CatalogUtils.checkTempPartitionStrictMatch(partitionList, tempPartitionList, listInfo);
             } else {
                 CatalogUtils.checkTempPartitionConflict(partitionList, tempPartitionList, listInfo);
+            }
+            // The auto-created partitions must not conflict with the formal partitions that are
+            // not part of this replacement.
+            if (!autoCreateTempPartitions.isEmpty()) {
+                CatalogUtils.checkTempPartitionConflict(partitionList, autoCreateTempPartitions, listInfo);
             }
         }
     }
